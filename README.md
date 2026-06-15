@@ -42,8 +42,8 @@ want generated images committed with the Markdown.
 
 | Area | Contract |
 | --- | --- |
-| Chapters | Uses EPUB `nav.xhtml` or NCX table-of-contents order |
-| Filenames | Prefixes files with stable numeric order |
+| Chapters | Uses EPUB `nav.xhtml` or NCX order, with OPF spine fallback |
+| Filenames | Prefixes files with stable numeric order and truncates long slugs |
 | Markdown | Emits GitHub-flavored Markdown through pandoc |
 | Images | Copies EPUB-local images to `images/` and rewrites image refs |
 | Remote media | Not fetched |
@@ -66,7 +66,7 @@ EPUB files are treated as untrusted archives.
 | Current limit | Notes |
 | --- | --- |
 | Cross-chapter links | May remain as original EPUB `.xhtml` hrefs |
-| Nested TOC entries | Multiple entries pointing to the same XHTML file become one Markdown file |
+| Fragment TOC entries | Split into separate Markdown files when anchors are present |
 | Image formats | EPUB-local files are copied as-is |
 | Layout fidelity | Output favors readable Markdown over exact EPUB layout |
 

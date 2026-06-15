@@ -32,8 +32,17 @@ class Epub2MdTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def make_epub(self, name="book.epub", toc_entries=None, files=None, symlinks=None):
-        toc_entries = toc_entries or [("Chapter", "xhtml/chapter.xhtml")]
+    def make_epub(
+        self,
+        name="book.epub",
+        toc_entries=None,
+        files=None,
+        symlinks=None,
+        spine_entries=None,
+        include_nav=True,
+    ):
+        if toc_entries is None:
+            toc_entries = [("Chapter", "xhtml/chapter.xhtml")]
         files = files or {
             "OEBPS/xhtml/chapter.xhtml": (
                 '<html xmlns="http://www.w3.org/1999/xhtml">'
@@ -44,10 +53,28 @@ class Epub2MdTests(unittest.TestCase):
         nav_items = "\n".join(
             f'<li><a href="{href}">{title}</a></li>' for title, href in toc_entries
         )
-        package_items = "\n                        ".join(
-            f'<item id="item{i}" href="{path[6:] if path.startswith("OEBPS/") else path}" media-type="application/xhtml+xml"/>'
-            for i, path in enumerate(files)
-            if path.endswith((".xhtml", ".html", ".htm"))
+        item_ids = {}
+        package_items = []
+        for i, path in enumerate(files):
+            if not path.endswith((".xhtml", ".html", ".htm")):
+                continue
+            href = path[6:] if path.startswith("OEBPS/") else path
+            item_id = f"item{i}"
+            item_ids[path] = item_id
+            item_ids[href] = item_id
+            package_items.append(
+                f'<item id="{item_id}" href="{href}" media-type="application/xhtml+xml"/>'
+            )
+        if include_nav:
+            package_items.insert(
+                0,
+                '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
+            )
+        package_items = "\n                        ".join(package_items)
+        spine_items = "\n                        ".join(
+            f'<itemref idref="{item_ids[path]}"/>'
+            for path in (spine_entries or [])
+            if path in item_ids
         )
 
         with zipfile.ZipFile(epub, "w") as zf:
@@ -72,24 +99,26 @@ class Epub2MdTests(unittest.TestCase):
                     <?xml version="1.0" encoding="utf-8"?>
                     <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
                       <manifest>
-                        <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
                         {package_items}
                       </manifest>
-                      <spine/>
+                      <spine>
+                        {spine_items}
+                      </spine>
                     </package>
                     """
                 ),
             )
-            zf.writestr(
-                "OEBPS/nav.xhtml",
-                textwrap.dedent(
-                    f"""\
-                    <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
-                      <body><nav epub:type="toc"><ol>{nav_items}</ol></nav></body>
-                    </html>
-                    """
-                ),
-            )
+            if include_nav:
+                zf.writestr(
+                    "OEBPS/nav.xhtml",
+                    textwrap.dedent(
+                        f"""\
+                        <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+                          <body><nav epub:type="toc"><ol>{nav_items}</ol></nav></body>
+                        </html>
+                        """
+                    ),
+                )
             for path, content in files.items():
                 if isinstance(content, bytes):
                     zf.writestr(path, content)
@@ -117,7 +146,14 @@ class Epub2MdTests(unittest.TestCase):
                 if "-o" in args:
                     out = pathlib.Path(args[args.index("-o") + 1])
                     out.parent.mkdir(parents=True, exist_ok=True)
-                    out.write_text("converted\\n")
+                    content = "converted\\n"
+                    if "--" in args and args.index("--") < len(args) - 1:
+                        inp = pathlib.Path(args[args.index("--") + 1])
+                        try:
+                            content = inp.read_text(encoding="utf-8", errors="ignore")
+                        except OSError:
+                            pass
+                    out.write_text(content)
                 raise SystemExit({exit_code})
                 """
             )
@@ -170,6 +206,136 @@ class Epub2MdTests(unittest.TestCase):
         self.assertIn("--", args)
         self.assertLess(args.index("--"), len(args) - 1)
 
+    def test_uses_spine_when_toc_is_missing(self):
+        files = {
+            "OEBPS/xhtml/one.xhtml": (
+                '<html xmlns="http://www.w3.org/1999/xhtml">'
+                "<body><h1>First Heading</h1><p>One</p></body></html>"
+            ),
+            "OEBPS/xhtml/two.xhtml": (
+                '<html xmlns="http://www.w3.org/1999/xhtml">'
+                "<body><h1>Second Heading</h1><p>Two</p></body></html>"
+            ),
+        }
+        epub = self.make_epub(
+            toc_entries=[],
+            files=files,
+            spine_entries=["OEBPS/xhtml/one.xhtml", "OEBPS/xhtml/two.xhtml"],
+            include_nav=False,
+        )
+        out = self.root / "out"
+
+        code, stdout, log = self.run_cli(epub, out)
+
+        self.assertIsNone(code)
+        self.assertIn("Using spine: 2 files", stdout)
+        self.assertTrue((out / "01-first-heading.md").exists())
+        self.assertTrue((out / "02-second-heading.md").exists())
+        self.assertEqual(len(self.read_pandoc_args(log)), 2)
+
+    def test_uses_spine_when_toc_coverage_is_too_low(self):
+        files = {
+            f"OEBPS/xhtml/{name}.xhtml": (
+                '<html xmlns="http://www.w3.org/1999/xhtml">'
+                f"<body><h1>{title}</h1><p>{title}</p></body></html>"
+            )
+            for name, title in [
+                ("one", "One"),
+                ("two", "Two"),
+                ("three", "Three"),
+                ("four", "Four"),
+            ]
+        }
+        epub = self.make_epub(
+            toc_entries=[("Only One", "xhtml/one.xhtml")],
+            files=files,
+            spine_entries=[
+                "OEBPS/xhtml/one.xhtml",
+                "OEBPS/xhtml/two.xhtml",
+                "OEBPS/xhtml/three.xhtml",
+                "OEBPS/xhtml/four.xhtml",
+            ],
+        )
+        out = self.root / "out"
+
+        code, stdout, _log = self.run_cli(epub, out)
+
+        self.assertIsNone(code)
+        self.assertIn("TOC covers 1/4 spine files, using spine instead", stdout)
+        self.assertIn("Done! 4 chapters", stdout)
+        self.assertTrue((out / "01-one.md").exists())
+        self.assertTrue((out / "04-four.md").exists())
+
+    def test_fragment_toc_splits_one_html_file_into_segments(self):
+        epub = self.make_epub(
+            toc_entries=[
+                ("Intro", "xhtml/chapter.xhtml"),
+                ("Part A", "xhtml/chapter.xhtml#a"),
+                ("Part B", "xhtml/chapter.xhtml#b"),
+            ],
+            files={
+                "OEBPS/xhtml/chapter.xhtml": (
+                    '<html xmlns="http://www.w3.org/1999/xhtml">'
+                    "<body>"
+                    "<p>Intro body</p>"
+                    '<h2 id="a">A</h2><p>A body</p>'
+                    '<h2 id="b">B</h2><p>B body</p>'
+                    "</body></html>"
+                )
+            },
+        )
+        out = self.root / "out"
+
+        code, stdout, _log = self.run_cli(epub, out)
+
+        self.assertIsNone(code)
+        self.assertIn("Done! 3 chapters", stdout)
+        intro = (out / "01-intro.md").read_text()
+        part_a = (out / "02-part-a.md").read_text()
+        part_b = (out / "03-part-b.md").read_text()
+        self.assertIn("Intro body", intro)
+        self.assertNotIn("A body", intro)
+        self.assertIn("A body", part_a)
+        self.assertNotIn("B body", part_a)
+        self.assertIn("B body", part_b)
+
+    def test_fragment_segments_keep_rewritten_image_links(self):
+        epub = self.make_epub(
+            toc_entries=[
+                ("Part A", "xhtml/chapter.xhtml#a"),
+                ("Part B", "xhtml/chapter.xhtml#b"),
+            ],
+            files={
+                "OEBPS/xhtml/chapter.xhtml": (
+                    '<html xmlns="http://www.w3.org/1999/xhtml">'
+                    "<body>"
+                    '<h2 id="a">A</h2><img src="../images/pic.png" alt="pic"/>'
+                    '<h2 id="b">B</h2><p>B body</p>'
+                    "</body></html>"
+                ),
+                "OEBPS/images/pic.png": PNG_BYTES,
+            },
+        )
+        out = self.root / "out"
+
+        code, _stdout, _log = self.run_cli(epub, out)
+
+        self.assertIsNone(code)
+        self.assertEqual((out / "images" / "pic.png").read_bytes(), PNG_BYTES)
+        self.assertIn("images/pic.png", (out / "01-part-a.md").read_text())
+
+    def test_long_output_slug_is_truncated(self):
+        title = "Very Long Chapter Title " * 8
+        epub = self.make_epub(toc_entries=[(title, "xhtml/chapter.xhtml")])
+        out = self.root / "out"
+
+        code, _stdout, _log = self.run_cli(epub, out)
+
+        self.assertIsNone(code)
+        expected = epub2md._safe_output_slug(title)
+        self.assertLessEqual(len(expected), epub2md.MAX_SLUG_LENGTH)
+        self.assertTrue((out / f"01-{expected}.md").exists())
+
     def test_option_like_toc_path_is_pandoc_file_argument(self):
         epub = self.make_epub(
             toc_entries=[("Chapter", "--lua-filter=evil.xhtml")],
@@ -208,7 +374,7 @@ class Epub2MdTests(unittest.TestCase):
 
         code, _stdout, log = self.run_cli(epub, out)
 
-        self.assertEqual(str(code), "Error: toc not found")
+        self.assertEqual(str(code), "Error: no toc or spine found")
         self.assertFalse(log.exists())
 
     def test_archive_path_traversal_is_rejected(self):

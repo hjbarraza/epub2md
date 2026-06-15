@@ -8,6 +8,7 @@ MAX_ARCHIVE_FILES = 10000
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_FILE_BYTES = 256 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 1000
+MAX_SLUG_LENGTH = 60
 
 LUA = """
 function Div(el) return el.content end
@@ -64,6 +65,11 @@ def _safe_child(root, base, href, allow_parent=False):
 def _safe_media_name(name):
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
     return safe or "image"
+
+
+def _safe_output_slug(title):
+    safe = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return safe[:MAX_SLUG_LENGTH].rstrip("-") or "untitled"
 
 
 def _copy_media(source, media, copied, used_names):
@@ -197,6 +203,33 @@ def _find_opf(root):
     return opf if opf.exists() else None
 
 
+def _parse_opf(root):
+    opf = _find_opf(root)
+    if opf is None:
+        return None, {}, None
+    try:
+        tree = ET.parse(opf)
+    except ET.ParseError:
+        return opf, {}, None
+    pkg = tree.getroot()
+    ns = {"opf": "http://www.idpf.org/2007/opf"}
+    manifest_el = pkg.find("opf:manifest", ns)
+    manifest = {}
+    if manifest_el is not None:
+        for item in manifest_el:
+            item_id = item.attrib.get("id")
+            if item_id:
+                manifest[item_id] = item
+    return opf, manifest, pkg.find("opf:spine", ns)
+
+
+def _split_href(href):
+    parsed = urlsplit(href.replace("\\", "/"))
+    _href_path(href)
+    fragment = unquote(parsed.fragment) if parsed.fragment else None
+    return unquote(parsed.path), fragment
+
+
 def _parse_ncx(ncx_path):
     try:
         tree = ET.parse(ncx_path)
@@ -213,7 +246,11 @@ def _parse_ncx(ncx_path):
         src = ce.get("src", "")
         if not src:
             continue
-        items.append((title, src))
+        try:
+            src, fragment = _split_href(src)
+        except EpubError:
+            continue
+        items.append((title, src, fragment))
     return ncx_path.parent, items
 
 
@@ -253,13 +290,12 @@ def _parse_nav(nav_path):
                     href = a_el.attrib.get("href", "")
                     if href:
                         try:
-                            _href_path(href)
+                            src, fragment = _split_href(href)
                         except EpubError:
                             continue
-                        if href:
-                            text = "".join(a_el.itertext()).strip()
-                            title = text or "untitled"
-                            items.append((title, href))
+                        text = "".join(a_el.itertext()).strip()
+                        title = text or "untitled"
+                        items.append((title, src, fragment))
                 for sub in child:
                     if _local_name(sub.tag) in ("ol", "ul"):
                         walk(sub)
@@ -269,24 +305,9 @@ def _parse_nav(nav_path):
 
 
 def _find_toc(root):
-    opf = _find_opf(root)
+    opf, manifest, spine_el = _parse_opf(root)
     if opf is None:
         return None, []
-    try:
-        tree = ET.parse(opf)
-    except ET.ParseError:
-        return None, []
-    pkg = tree.getroot()
-    ns = {"opf": "http://www.idpf.org/2007/opf"}
-    manifest_el = pkg.find("opf:manifest", ns)
-    if manifest_el is None:
-        return None, []
-    manifest = {}
-    for item in manifest_el:
-        item_id = item.attrib.get("id")
-        if item_id:
-            manifest[item_id] = item
-    spine_el = pkg.find("opf:spine", ns)
 
     nav_item = None
     for it in manifest.values():
@@ -333,6 +354,185 @@ def _find_toc(root):
     return None, []
 
 
+def _find_spine(root):
+    opf, manifest, spine_el = _parse_opf(root)
+    if opf is None or spine_el is None:
+        return None, []
+
+    items = []
+    for ref in spine_el:
+        if _local_name(ref.tag) != "itemref":
+            continue
+        item = manifest.get(ref.attrib.get("idref", ""))
+        if item is None:
+            continue
+        href = item.attrib.get("href", "")
+        media_type = item.attrib.get("media-type", "")
+        if not href or "html" not in media_type:
+            continue
+        try:
+            src, _fragment = _split_href(href)
+        except EpubError:
+            continue
+        items.append(src)
+    return opf.parent, items
+
+
+def _extract_title(path):
+    try:
+        tree = ET.parse(path)
+    except (ET.ParseError, OSError):
+        return None
+    for tag_name in ("h1", "h2", "h3"):
+        for el in tree.getroot().iter():
+            if _local_name(el.tag) != tag_name:
+                continue
+            text = " ".join("".join(el.itertext()).split())
+            if text:
+                return text
+    return None
+
+
+def _build_toc_chapters(root, base_dir, items):
+    chapters = []
+    seen = set()
+    for order, item in enumerate(items, 1):
+        title, src, fragment = item
+        try:
+            html_path = _safe_child(root, base_dir, src)
+        except EpubError:
+            continue
+        if html_path.suffix.lower() not in (".xhtml", ".html", ".htm"):
+            continue
+        if not html_path.exists():
+            continue
+        key = (str(html_path.resolve()), fragment or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        chapters.append(
+            {
+                "order": order,
+                "title": title,
+                "html_path": html_path,
+                "fragment": fragment,
+                "start_id": None,
+                "end_id": None,
+            }
+        )
+    return chapters
+
+
+def _build_spine_chapters(root, base_dir, items):
+    chapters = []
+    seen = set()
+    for order, src in enumerate(items, 1):
+        try:
+            html_path = _safe_child(root, base_dir, src)
+        except EpubError:
+            continue
+        if html_path.suffix.lower() not in (".xhtml", ".html", ".htm"):
+            continue
+        if not html_path.exists():
+            continue
+        key = str(html_path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        chapters.append(
+            {
+                "order": order,
+                "title": _extract_title(html_path) or Path(src).stem,
+                "html_path": html_path,
+                "fragment": None,
+                "start_id": None,
+                "end_id": None,
+            }
+        )
+    return chapters
+
+
+def _spine_html_paths(root, base_dir, items):
+    paths = set()
+    if base_dir is None:
+        return paths
+    for src in items:
+        try:
+            html_path = _safe_child(root, base_dir, src)
+        except EpubError:
+            continue
+        if html_path.exists():
+            paths.add(str(html_path.resolve()))
+    return paths
+
+
+def _assign_fragment_ranges(chapters):
+    by_file = {}
+    for chapter in chapters:
+        key = str(chapter["html_path"].resolve())
+        by_file.setdefault(key, []).append(chapter)
+
+    for group in by_file.values():
+        group.sort(key=lambda chapter: chapter["order"])
+        if not any(chapter["fragment"] for chapter in group):
+            continue
+        for index, chapter in enumerate(group):
+            next_fragment = next(
+                (
+                    later["fragment"]
+                    for later in group[index + 1 :]
+                    if later["fragment"]
+                ),
+                None,
+            )
+            if chapter["fragment"]:
+                chapter["start_id"] = chapter["fragment"]
+                chapter["end_id"] = next_fragment
+            elif index == 0 and next_fragment:
+                chapter["end_id"] = next_fragment
+
+
+def _find_anchor(text, anchor):
+    if not anchor:
+        return None
+    for match in re.finditer(r"\b(?:id|name)\s*=\s*(['\"])(.*?)\1", text, re.I):
+        if match.group(2) != anchor:
+            continue
+        start = text.rfind("<", 0, match.start())
+        return start if start != -1 else match.start()
+    return None
+
+
+def _extract_segment(text, start_id, end_id):
+    if not start_id and not end_id:
+        return None
+    start = _find_anchor(text, start_id) if start_id else 0
+    if start is None:
+        return None
+    end = len(text)
+    if end_id:
+        end_pos = _find_anchor(text, end_id)
+        if end_pos is not None and end_pos > start:
+            end = end_pos
+    segment = text[start:end].strip()
+    return segment or None
+
+
+def _chapter_input(chapter, prepared_path, work_dir):
+    if chapter["start_id"] is None and chapter["end_id"] is None:
+        return prepared_path
+    try:
+        text = prepared_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return prepared_path
+    segment = _extract_segment(text, chapter["start_id"], chapter["end_id"])
+    if segment is None:
+        return prepared_path
+    target = work_dir / f"{len(list(work_dir.iterdir())):05d}-segment.xhtml"
+    target.write_text(segment, encoding="utf-8")
+    return target
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ["-h", "--help"]:
         print(
@@ -377,32 +577,45 @@ def main():
         used_image_names = set()
 
         base_dir, items = _find_toc(book)
-        if base_dir is None or not items:
-            sys.exit("Error: toc not found")
+        spine_dir, spine_files = _find_spine(book)
+        chapters = []
+        use_spine = False
+        if base_dir is not None and items:
+            chapters = _build_toc_chapters(book, base_dir, items)
+            spine_paths = _spine_html_paths(book, spine_dir, spine_files)
+            toc_paths = {str(chapter["html_path"].resolve()) for chapter in chapters}
+            if spine_paths and len(toc_paths) < len(spine_paths) * 0.5:
+                print(
+                    f"TOC covers {len(toc_paths)}/{len(spine_paths)} spine files, using spine instead"
+                )
+                use_spine = True
+        else:
+            use_spine = True
 
-        print(f"Found {len(items)} entries in toc")
+        if use_spine or not chapters:
+            if spine_dir is None or not spine_files:
+                sys.exit("Error: no toc or spine found")
+            chapters = _build_spine_chapters(book, spine_dir, spine_files)
+            if not chapters:
+                sys.exit("Error: no html chapters found")
+            print(f"Using spine: {len(chapters)} files")
+        else:
+            _assign_fragment_ranges(chapters)
+            print(f"Found {len(items)} entries in toc")
 
         n = 0
         failures = 0
-        seen = set()
-        for title, src in items:
-            try:
-                html_path = _safe_child(book, base_dir, src)
-            except EpubError:
-                continue
-            if html_path.suffix.lower() not in (".xhtml", ".html", ".htm"):
-                continue
-            if not html_path.exists():
-                continue
-            key = str(html_path.resolve())
-            if key in seen:
-                continue
-            seen.add(key)
-
+        for chapter in sorted(chapters, key=lambda item: item["order"]):
             pandoc_input = _prepare_html_for_pandoc(
-                book, html_path, media, html_work, copied_images, used_image_names
+                book,
+                chapter["html_path"],
+                media,
+                html_work,
+                copied_images,
+                used_image_names,
             )
-            safe = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "untitled"
+            pandoc_input = _chapter_input(chapter, pandoc_input, html_work)
+            safe = _safe_output_slug(chapter["title"])
             name = out / f"{n + 1:02d}-{safe}.md"
 
             r = subprocess.run(
@@ -427,10 +640,10 @@ def main():
 
             if r.returncode == 0:
                 n += 1
-                print(f"✓ {n:02d} {title}")
+                print(f"✓ {n:02d} {chapter['title']}")
             else:
                 failures += 1
-                print(f"✗ {title}")
+                print(f"✗ {chapter['title']}")
                 if r.stderr:
                     print(f"  Error: {r.stderr[:200]}")
 
