@@ -4,13 +4,15 @@ version = "0.1.4"
 description = "Convert EPUB to clean Markdown chapters"
 readme = "README.md"
 requires-python = ">=3.8"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = []
 
 [project.scripts]
 epub2md = "epub2md:main"
 
 [project.urls]
-Repository = "https://github.com/mefengl/epub2md"
+Repository = "https://github.com/hjbarraza/epub2md"
 
 [build-system]
 requires = ["uv_build>=0.9.9,<0.10.0"]

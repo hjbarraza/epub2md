@@ -1,6 +1,11 @@
 # epub2md
 
-Convert EPUB to clean Markdown chapters.
+EPUB to Markdown chapters.
+
+| Input | Output | Images |
+| --- | --- | --- |
+| `book.epub` | `book/*.md` | `book/images/*` |
+| `book.epub output` | `output/*.md` | `output/images/*` |
 
 ## Install
 
@@ -8,29 +13,39 @@ Convert EPUB to clean Markdown chapters.
 pip install epub2md
 ```
 
-## Usage
+## Use
 
 ```bash
-epub2md book.epub          # Creates book/*.md and book/images/
-epub2md book.epub output   # Creates output/*.md and output/images/
+epub2md book.epub
+epub2md book.epub output
 ```
 
-Output:
-```
-book/
-├── 01-chapter-i.md
-├── 02-chapter-ii.md
+```text
+output/
+├── 01-chapter.md
+├── 02-chapter.md
 ├── ...
 └── images/
-    └── *.jpeg
+    ├── figure.png
+    └── .gitignore
 ```
 
-> Images are git-ignored by default. To commit them: `rm book/images/.gitignore`
+## Details
+
+| Area | Behavior |
+| --- | --- |
+| Chapters | Uses EPUB navigation/TOC order |
+| Markdown | Writes GitHub-flavored Markdown |
+| Images | Copies EPUB-local images into `images/` |
+| Safety | Rejects archive traversal, symlinks, and unsafe paths |
+
+Images are git-ignored by default. Remove `output/images/.gitignore` to commit them.
 
 ## Requirements
 
-- Python 3.8+
-- [pandoc](https://pandoc.org/installing.html)
+| Runtime | External |
+| --- | --- |
+| Python 3.8+ | [pandoc](https://pandoc.org/installing.html) |
 
 ## License
 
